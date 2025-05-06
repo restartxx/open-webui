@@ -1,176 +1,467 @@
-# syntax=docker/dockerfile:1
-# Initialize device type args
-# use build args in the docker build command with --build-arg="BUILDARG=true"
-ARG USE_CUDA=false
-ARG USE_OLLAMA=false
-# Tested with cu117 for CUDA 11 and cu121 for CUDA 12 (default)
-ARG USE_CUDA_VER=cu128
-# any sentence transformer model; models to use can be found at https://huggingface.co/models?library=sentence-transformers
-# Leaderboard: https://huggingface.co/spaces/mteb/leaderboard 
-# for better performance and multilangauge support use "intfloat/multilingual-e5-large" (~2.5GB) or "intfloat/multilingual-e5-base" (~1.5GB)
-# IMPORTANT: If you change the embedding model (sentence-transformers/all-MiniLM-L6-v2) and vice versa, you aren't able to use RAG Chat with your previous documents loaded in the WebUI! You need to re-embed them.
-ARG USE_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-ARG USE_RERANKING_MODEL=""
+name: Create and publish Docker images with specific build args to Docker Hub
 
-# Tiktoken encoding name; models to use can be found at https://huggingface.co/models?library=tiktoken
-ARG USE_TIKTOKEN_ENCODING_NAME="cl100k_base"
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - dev
+    tags:
+      - v*
 
-ARG BUILD_HASH=dev-build
-# Override at your own risk - non-root configurations are untested
-ARG UID=0
-ARG GID=0
+env:
+  REGISTRY: docker.io
 
-######## WebUI frontend ########
-FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS build
-ARG BUILD_HASH
+jobs:
+  build-main-image:
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
 
-WORKDIR /app
+    steps:
+      - name: Set repository and image name to lowercase
+        run: |
+          REPO_NAME=${{ github.repository }}
+          IMAGE_NAME=${REPO_NAME##*/}
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >>${GITHUB_ENV}
+          echo "FULL_IMAGE_NAME=${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME,,}" >>${GITHUB_ENV}
 
-COPY package.json package-lock.json ./
-RUN npm ci
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
 
-COPY . .
-ENV APP_BUILD_HASH=${BUILD_HASH}
-RUN npm run build
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-######## WebUI backend ########
-FROM python:3.11-slim-bookworm AS base
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-# Use args
-ARG USE_CUDA
-ARG USE_OLLAMA
-ARG USE_CUDA_VER
-ARG USE_EMBEDDING_MODEL
-ARG USE_RERANKING_MODEL
-ARG UID
-ARG GID
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-## Basis ##
-ENV ENV=prod \
-    PORT=8080 \
-    # pass build args to the build
-    USE_OLLAMA_DOCKER=${USE_OLLAMA} \
-    USE_CUDA_DOCKER=${USE_CUDA} \
-    USE_CUDA_DOCKER_VER=${USE_CUDA_VER} \
-    USE_EMBEDDING_MODEL_DOCKER=${USE_EMBEDDING_MODEL} \
-    USE_RERANKING_MODEL_DOCKER=${USE_RERANKING_MODEL}
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-## Basis URL Config ##
-ENV OLLAMA_BASE_URL="/ollama" \
-    OPENAI_API_BASE_URL=""
+      - name: Extract metadata for Docker images (default latest tag)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=git-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          flavor: |
+            latest=${{ github.ref == 'refs/heads/main' }}
 
-## API Key and Security Config ##
-ENV OPENAI_API_KEY="" \
-    WEBUI_SECRET_KEY="" \
-    SCARF_NO_ANALYTICS=true \
-    DO_NOT_TRACK=true \
-    ANONYMIZED_TELEMETRY=false
+      - name: Extract metadata for Docker cache
+        id: cache-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            ${{ github.ref_type == 'tag' && 'type=raw,value=main' || '' }}
+          flavor: |
+            prefix=cache-${{ matrix.platform }}-
+            latest=false
 
-#### Other models #########################################################
-## whisper TTS model settings ##
-ENV WHISPER_MODEL="base" \
-    WHISPER_MODEL_DIR="/app/backend/data/cache/whisper/models"
+      - name: Build and push Docker image (latest)
+        uses: docker/build-push-action@v5
+        id: build
+        with:
+          context: .
+          push: true
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.FULL_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ steps.cache-meta.outputs.tags }}
+          cache-to: type=registry,ref=${{ steps.cache-meta.outputs.tags }},mode=max
+          build-args: |
+            BUILD_HASH=${{ github.sha }}
 
-## RAG Embedding model settings ##
-ENV RAG_EMBEDDING_MODEL="$USE_EMBEDDING_MODEL_DOCKER" \
-    RAG_RERANKING_MODEL="$USE_RERANKING_MODEL_DOCKER" \
-    SENTENCE_TRANSFORMERS_HOME="/app/backend/data/cache/embedding/models"
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
 
-## Tiktoken model settings ##
-ENV TIKTOKEN_ENCODING_NAME="cl100k_base" \
-    TIKTOKEN_CACHE_DIR="/app/backend/data/cache/tiktoken"
-
-## Hugging Face download cache ##
-ENV HF_HOME="/app/backend/data/cache/embedding/models"
-
-## Torch Extensions ##
-# ENV TORCH_EXTENSIONS_DIR="/.cache/torch_extensions"
-
-#### Other models ##########################################################
-
-WORKDIR /app/backend
-
-ENV HOME=/root
-# Create user and group if not root
-RUN if [ $UID -ne 0 ]; then \
-    if [ $GID -ne 0 ]; then \
-    addgroup --gid $GID app; \
-    fi; \
-    adduser --uid $UID --gid $GID --home $HOME --disabled-password --no-create-home app; \
-    fi
-
-RUN mkdir -p $HOME/.cache/chroma
-RUN echo -n 00000000-0000-0000-0000-000000000000 > $HOME/.cache/chroma/telemetry_user_id
-
-# Make sure the user has access to the app and root directory
-RUN chown -R $UID:$GID /app $HOME
-
-RUN if [ "$USE_OLLAMA" = "true" ]; then \
-    apt-get update && \
-    # Install pandoc and netcat
-    apt-get install -y --no-install-recommends git build-essential pandoc netcat-openbsd curl && \
-    apt-get install -y --no-install-recommends gcc python3-dev && \
-    # for RAG OCR
-    apt-get install -y --no-install-recommends ffmpeg libsm6 libxext6 && \
-    # install helper tools
-    apt-get install -y --no-install-recommends curl jq && \
-    # install ollama
-    curl -fsSL https://ollama.com/install.sh | sh && \
-    # cleanup
-    rm -rf /var/lib/apt/lists/*; \
-    else \
-    apt-get update && \
-    # Install pandoc, netcat and gcc
-    apt-get install -y --no-install-recommends git build-essential pandoc gcc netcat-openbsd curl jq && \
-    apt-get install -y --no-install-recommends gcc python3-dev && \
-    # for RAG OCR
-    apt-get install -y --no-install-recommends ffmpeg libsm6 libxext6 && \
-    # cleanup
-    rm -rf /var/lib/apt/lists/*; \
-    fi
-
-# install python dependencies
-COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
-
-RUN pip3 install --no-cache-dir uv && \
-    if [ "$USE_CUDA" = "true" ]; then \
-    # If you use CUDA the whisper and embedding model will be downloaded on first use
-    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/$USE_CUDA_DOCKER_VER --no-cache-dir && \
-    uv pip install --system -r requirements.txt --no-cache-dir && \
-    python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')" && \
-    python -c "import os; from faster_whisper import WhisperModel; WhisperModel(os.environ['WHISPER_MODEL'], device='cpu', compute_type='int8', download_root=os.environ['WHISPER_MODEL_DIR'])"; \
-    python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])"; \
-    else \
-    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --no-cache-dir && \
-    uv pip install --system -r requirements.txt --no-cache-dir && \
-    python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')" && \
-    python -c "import os; from faster_whisper import WhisperModel; WhisperModel(os.environ['WHISPER_MODEL'], device='cpu', compute_type='int8', download_root=os.environ['WHISPER_MODEL_DIR'])"; \
-    python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])"; \
-    fi; \
-    chown -R $UID:$GID /app/backend/data/
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-main-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
 
+  build-cuda-image:
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
 
-# copy embedding weight from build
-# RUN mkdir -p /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2
-# COPY --from=build /app/onnx /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx
+    steps:
+      - name: Set repository and image name to lowercase
+        run: |
+          REPO_NAME=${{ github.repository }}
+          IMAGE_NAME=${REPO_NAME##*/}
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >>${GITHUB_ENV}
+          echo "FULL_IMAGE_NAME=${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME,,}" >>${GITHUB_ENV]
 
-# copy built frontend files
-COPY --chown=$UID:$GID --from=build /app/build /app/build
-COPY --chown=$UID:$GID --from=build /app/CHANGELOG.md /app/CHANGELOG.md
-COPY --chown=$UID:$GID --from=build /app/package.json /app/package.json
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
 
-# copy backend files
-COPY --chown=$UID:$GID ./backend .
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-EXPOSE 8080
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-HEALTHCHECK CMD curl --silent --fail http://localhost:${PORT:-8080}/health | jq -ne 'input.status == true' || exit 1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-USER $UID:$GID
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-ARG BUILD_HASH
-ENV WEBUI_BUILD_VERSION=${BUILD_HASH}
-ENV DOCKER=true
+      - name: Extract metadata for Docker images (cuda tag)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=git-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,enable=${{ github.ref == 'refs/heads/main' }},prefix=,suffix=,value=cuda
+          flavor: |
+            latest=${{ github.ref == 'refs/heads/main' }}
+            suffix=-cuda,onlatest=true
 
-CMD [ "bash", "start.sh"]
+      - name: Extract metadata for Docker cache
+        id: cache-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            ${{ github.ref_type == 'tag' && 'type=raw,value=main' || '' }}
+          flavor: |
+            prefix=cache-cuda-${{ matrix.platform }}-
+            latest=false
+
+      - name: Build and push Docker image (cuda)
+        uses: docker/build-push-action@v5
+        id: build
+        with:
+          context: .
+          push: true
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.FULL_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ steps.cache-meta.outputs.tags }}
+          cache-to: type=registry,ref=${{ steps.cache-meta.outputs.tags }},mode=max
+          build-args: |
+            BUILD_HASH=${{ github.sha }}
+            USE_CUDA=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-cuda-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+
+  build-ollama-image:
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+
+    steps:
+      - name: Set repository and image name to lowercase
+        run: |
+          REPO_NAME=${{ github.repository }}
+          IMAGE_NAME=${REPO_NAME##*/}
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >>${GITHUB_ENV}
+          echo "FULL_IMAGE_NAME=${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME,,}" >>${GITHUB_ENV}
+
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata for Docker images (ollama tag)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=git-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,enable=${{ github.ref == 'refs/heads/main' }},prefix=,suffix=,value=ollama
+          flavor: |
+            latest=${{ github.ref == 'refs/heads/main' }}
+            suffix=-ollama,onlatest=true
+
+      - name: Extract metadata for Docker cache
+        id: cache-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            ${{ github.ref_type == 'tag' && 'type=raw,value=main' || '' }}
+          flavor: |
+            prefix=cache-ollama-${{ matrix.platform }}-
+            latest=false
+
+      - name: Build and push Docker image (ollama)
+        uses: docker/build-push-action@v5
+        id: build
+        with:
+          context: .
+          push: true
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.FULL_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ steps.cache-meta.outputs.tags }}
+          cache-to: type=registry,ref=${{ steps.cache-meta.outputs.tags }},mode=max
+          build-args: |
+            BUILD_HASH=${{ github.sha }}
+            USE_OLLAMA=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-ollama-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+
+  merge-main-images:
+    runs-on: ubuntu-latest
+    needs: [build-main-image]
+    steps:
+      - name: Set repository and image name to lowercase
+        run: |
+          REPO_NAME=${{ github.repository }}
+          IMAGE_NAME=${REPO_NAME##*/}
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >>${GITHUB_ENV}
+          echo "FULL_IMAGE_NAME=${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME,,}" >>${GITHUB_ENV}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-main-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata for Docker images (default latest tag)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=git-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          flavor: |
+            latest=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.FULL_IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.FULL_IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+
+  merge-cuda-images:
+    runs-on: ubuntu-latest
+    needs: [build-cuda-image]
+    steps:
+      - name: Set repository and image name to lowercase
+        run: |
+          REPO_NAME=${{ github.repository }}
+          IMAGE_NAME=${REPO_NAME##*/}
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >>${GITHUB_ENV}
+          echo "FULL_IMAGE_NAME=${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME,,}" >>${GITHUB_ENV}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-cuda-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata for Docker images (default cuda tag)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=git-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,enable=${{ github.ref == 'refs/heads/main' }},prefix=,suffix=,value=cuda
+          flavor: |
+            latest=${{ github.ref == 'refs/heads/main' }}
+            suffix=-cuda,onlatest=true
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.FULL_IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.FULL_IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+
+  merge-ollama-images:
+    runs-on: ubuntu-latest
+    needs: [build-ollama-image]
+    steps:
+      - name: Set repository and image name to lowercase
+        run: |
+          REPO_NAME=${{ github.repository }}
+          IMAGE_NAME=${REPO_NAME##*/}
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >>${GITHUB_ENV}
+          echo "FULL_IMAGE_NAME=${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME,,}" >>${GITHUB_ENV}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-ollama-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata for Docker images (default ollama tag)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FULL_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=git-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,enable=${{ github.ref == 'refs/heads/main' }},prefix=,suffix=,value=ollama
+          flavor: |
+            latest=${{ github.ref == 'refs/heads/main' }}
+            suffix=-ollama,onlatest=true
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.FULL_IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.FULL_IMAGE_NAME }}:${{ steps.meta.outputs.version }}
